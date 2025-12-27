@@ -26,7 +26,7 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "fb_truetype.h"
 
-#define MAX_FONTS 4
+#define MAX_FONTS 5
 #define MAX_ESCAPE_PARAMS 16
 #define MAX_TERM_COLS 500
 #define MAX_TERM_ROWS 200
@@ -958,6 +958,11 @@ int main(int argc, char **argv) {
     }
     if (num_fonts < MAX_FONTS) {
         if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansThai-Regular.ttf", "Thai") == 0) {
+            num_fonts++;
+        }
+    }
+    if (num_fonts < MAX_FONTS) {
+        if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "CJK") == 0) {
             num_fonts++;
         }
     }
