@@ -1,6 +1,6 @@
 /*
  * Framebuffer Terminal Emulator - Full PTY-based terminal with ANSI support
- * Compile: gcc -o fb_term fb_term.c fb_map.c -lm -lutil
+ * Compile: gcc -o fb_term fb_term.c -lm -lutil
  * Run: sudo ./fb_term /path/to/font.ttf
  */
 
@@ -13,7 +13,6 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <linux/fb.h>
-#include <linux/input.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <stdint.h>
@@ -23,11 +22,9 @@
 #include <pty.h>
 #include <utmp.h>
 #include <signal.h>
-#include <dirent.h>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
-#include "fb_map.h"
 
 #define MAX_FONTS 4
 #define MAX_ESCAPE_PARAMS 16
@@ -860,57 +857,6 @@ void term_render(struct framebuffer *fb, struct terminal *term,
     }
 }
 
-/* Find and open keyboard device */
-int open_keyboard(void) {
-    DIR *dir = opendir("/dev/input");
-    if (!dir) {
-        perror("opendir /dev/input");
-        return -1;
-    }
-
-    struct dirent *entry;
-    int kbd_fd = -1;
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, "event", 5) != 0) continue;
-
-        char path[512];
-        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
-
-        int fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (fd < 0) continue;
-
-        /* Check if this is a keyboard device */
-        unsigned long evbit = 0;
-        ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), &evbit);
-
-        if (evbit & (1 << EV_KEY)) {
-            /* Check for common keyboard keys */
-            unsigned long keybit[KEY_MAX/8 + 1] = {0};
-            ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
-
-            /* Check if it has letter keys (likely a keyboard) */
-            int has_letters = 0;
-            for (int i = KEY_Q; i <= KEY_P; i++) {
-                if (keybit[i/8] & (1 << (i % 8))) {
-                    has_letters = 1;
-                    break;
-                }
-            }
-
-            if (has_letters) {
-                kbd_fd = fd;
-                fprintf(stderr, "Using keyboard: %s\n", path);
-                break;
-            }
-        }
-
-        close(fd);
-    }
-
-    closedir(dir);
-    return kbd_fd;
-}
 
 int spawn_shell(int *master_fd, int cols, int rows) {
     struct winsize ws = {
@@ -970,7 +916,6 @@ int main(int argc, char **argv) {
     }
 
     init_color_palette();
-    kb_init();
 
     const char *font_path = argv[1];
     float user_font_size = 0.0f;  /* 0 means auto-calculate */
@@ -1100,22 +1045,11 @@ int main(int argc, char **argv) {
         int ret = select(max_fd + 1, &fds, NULL, NULL, &tv);
 
         if (ret > 0) {
-            /* Input from stdin */
+            /* Input from stdin - pass everything directly to PTY */
             if (FD_ISSET(STDIN_FILENO, &fds)) {
                 ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                 if (n > 0) {
-                    /* Check for Ctrl+Q to quit */
-                    for (ssize_t i = 0; i < n; i++) {
-                        if (buf[i] == 0x11) {  /* Ctrl+Q */
-                            running = 0;
-                            break;
-                        }
-                    }
-
-                    if (running) {
-                        /* Pass everything directly to PTY */
-                        write(master_fd, buf, n);
-                    }
+                    write(master_fd, buf, n);
                 }
             }
 
