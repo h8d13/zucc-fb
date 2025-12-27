@@ -10,16 +10,14 @@ Example: `cat chars.txt`
 
 ---
 
+Use generic then fallback:
+
 `noto-fonts` For Latin, Greek, Cyrillic
+
 `noto-fonts-cjk` For Chinese, Japanese, Korean
+
 `noto-fonts-extra` For Arabic, Hebrew, Thai, and other scripts
 
-1. Generic - /usr/share/fonts/noto/NotoSans-Regular.ttf
-2. Arabic fallback - /usr/share/fonts/noto/NotoSansArabic-Regular.ttf
-3. Hebrew fallback - /usr/share/fonts/noto/NotoSansHebrew-Regular.ttf
-4. Thai fallback - /usr/share/fonts/noto/NotoSansThai-Regular.ttf
-5. CJK fallback - /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc
-
-Attempt was to cover 99% of cases.
+Attempt was to cover 99% of cases 0 dependencies and 20mb of fonts added.
 
 To check your available categories: `ls -la /usr/share/fonts/` 
