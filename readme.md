@@ -7,16 +7,14 @@
 
 ---
 
+`noto-fonts` For Latin, Greek, Cyrillic
+`noto-fonts-cjk` For Chinese, Japanese, Korean
+
 1. Primary font - the one you specify on the command line (Usually also a Noto-something)
 2. Arabic fallback - /usr/share/fonts/noto/NotoSansArabic-Regular.ttf
 3. Hebrew fallback - /usr/share/fonts/noto/NotoSansHebrew-Regular.ttf
 4. Thai fallback - /usr/share/fonts/noto/NotoSansThai-Regular.ttf
 
-Attempt was to cover 99% of cases (with 0 depends) using:
+`local/noto-fonts-extra` provides 2-4. 
 
-```
-pacman -Qs | grep noto        
-local/noto-fonts
-local/noto-fonts-cjk
-local/noto-fonts-extra
-```
+Attempt was to cover 99% of cases (with 0 depends).
