@@ -24,6 +24,6 @@ Attempt was to cover 99% of cases 0 dependencies and 20mb of fonts added.
 To check your available categories: `ls -la /usr/share/fonts/` 
 
 Building: `xtraktor.sh` just bundles the fonts.
-Then `./iso_mod` creates the ISO.
+Then `./iso_mod` creates the ISO. Will prompt for `sudo` at `archiso`.
 
 ---
