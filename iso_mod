@@ -62,7 +62,6 @@ cp "$SCRIPT_DIR/in/noto-fonts-bundle.tar.gz" "$PROFILE_DIR/airootfs/root/fb_term
 echo "Mod pkg list..."
 {
     echo "git"
-    echo "util-linux"  # Provides libutil for pty support
 } >> "$PROFILE_DIR/packages.x86_64"
 
 echo "Creating customize_airootfs.sh..."
