@@ -12,7 +12,7 @@
 3. Hebrew fallback - /usr/share/fonts/noto/NotoSansHebrew-Regular.ttf
 4. Thai fallback - /usr/share/fonts/noto/NotoSansThai-Regular.ttf
 
-Attempt was to cover 99% of cases using:
+Attempt was to cover 99% of cases (with 0 depends) using:
 
 ```
 pacman -Qs | grep noto        
