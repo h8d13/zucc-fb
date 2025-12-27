@@ -24,7 +24,7 @@
 #include <signal.h>
 
 #define STB_TRUETYPE_IMPLEMENTATION
-#include "stb_truetype.h"
+#include "fb_truetype.h"
 
 #define MAX_FONTS 4
 #define MAX_ESCAPE_PARAMS 16
