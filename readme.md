@@ -14,7 +14,7 @@ Example `cat chars.example`
 `noto-fonts-cjk` For Chinese, Japanese, Korean
 `noto-fonts-extra` For Arabic, Hebrew, Thai, and other scripts
 
-1. Primary font - the one you specify on the command line (Usually also a Noto-something)
+1. Generic - /usr/share/fonts/noto/NotoSans-Regular.ttf
 2. Arabic fallback - /usr/share/fonts/noto/NotoSansArabic-Regular.ttf
 3. Hebrew fallback - /usr/share/fonts/noto/NotoSansHebrew-Regular.ttf
 4. Thai fallback - /usr/share/fonts/noto/NotoSansThai-Regular.ttf
