@@ -2,7 +2,7 @@
 
 ```shell
     # gcc -o out/fb_term fb_term.c -lm -lutil
-    # ./fb_term /path/to/font.ttf [font_size]
+    # ./out/fb_term /path/to/font.ttf [font_size]
 ```
 > This sets a base-font but fallsback to see bellow. It opens a terminal using a PTY. 
 
