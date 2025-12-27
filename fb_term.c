@@ -1,6 +1,6 @@
 /*
  * Framebuffer Terminal Emulator - Full PTY-based terminal with ANSI support
- * Compile: gcc -o fb_term fb_term.c -lm -lutil
+ * Compile: gcc -o out/fb_term fb_term.c -lm -lutil
  * Run: sudo ./fb_term /path/to/font.ttf
  */
 
