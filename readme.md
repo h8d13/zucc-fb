@@ -17,4 +17,4 @@
 
 `local/noto-fonts-extra` provides 2-4. 
 
-Attempt was to cover 99% of cases (with 0 depends).
+Attempt was to cover 99% of cases (with 0 depends). To check your available categories: `ls -la /usr/share/fonts/` 
