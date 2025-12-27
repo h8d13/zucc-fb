@@ -6,7 +6,8 @@
 ```
 > This sets a base-font but fallsback to see bellow. It opens a terminal using a PTY. 
 
-Example: `cat chars.txt`
+Example: You can already try/test in a TTY `sudo ./out/fb_term /path/to/font.ttf [font_size]`
+Then cat `chars.txt`
 
 ---
 
@@ -21,3 +22,8 @@ Use generic then fallback:
 Attempt was to cover 99% of cases 0 dependencies and 20mb of fonts added.
 
 To check your available categories: `ls -la /usr/share/fonts/` 
+
+Building: `xtraktor.sh` just bundles the fonts.
+Then `./iso_mod` creates the ISO.
+
+---
