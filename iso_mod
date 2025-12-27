@@ -116,7 +116,7 @@ EOF
 # add git clone command to zsh history testing
 echo "Adding git clone to zsh history..."
 cat > "$PROFILE_DIR/airootfs/root/.zsh_history" << 'HISTEOF'
-: 1728000000:0;pacman-key --init && git clone https://github.com/archlinux/archinstall && cd archinstall-patch && python -m archinstall
+: 1728000000:0;pacman-key --init && git clone https://github.com/archlinux/archinstall && cd archinstall && python -m archinstall
 HISTEOF
 
 echo "Styling pacman.conf (Color + ILoveCandy)..."
