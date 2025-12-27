@@ -1033,16 +1033,15 @@ int main(int argc, char **argv) {
     /* Set terminal's master_fd so it can respond to queries */
     term.master_fd = master_fd;
 
-    /* Hide the VT console cursor */
-    printf("\033[?25l");  /* Hide cursor */
-    fflush(stdout);
-
     /* Set stdin to raw mode to capture all keyboard input */
-    struct termios old_term, raw_term;
-    tcgetattr(STDIN_FILENO, &old_term);
-    raw_term = old_term;
-    cfmakeraw(&raw_term);
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw_term);
+    struct termios old_term;
+    int stdin_is_tty = 0;
+    if (tcgetattr(STDIN_FILENO, &old_term) == 0) {
+        stdin_is_tty = 1;
+        struct termios raw_term = old_term;
+        cfmakeraw(&raw_term);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw_term);
+    }
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
     unsigned char buf[4096];
@@ -1106,11 +1105,9 @@ int main(int argc, char **argv) {
     }
 
     /* Restore terminal settings */
-    tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
-
-    /* Show the VT console cursor again */
-    printf("\033[?25h");  /* Show cursor */
-    fflush(stdout);
+    if (stdin_is_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+    }
 
     fb_clear(&fb, 0x00000000);
 

@@ -1,4 +1,4 @@
-# Zucc
+# Zucc AKA Tux2-Internarchinstall 🐧🌎
 
 ```shell
     # gcc -o out/fb_term fb_term.c -lm -lutil
@@ -6,7 +6,7 @@
 ```
 > This sets a base-font but fallsback to see bellow. It opens a terminal using a PTY. 
 
-Example `cat chars.example`
+Example: `cat chars.txt`
 
 ---
 
