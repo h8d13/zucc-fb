@@ -78,7 +78,8 @@ struct terminal {
         STATE_NORMAL,
         STATE_ESC,
         STATE_CSI,
-        STATE_OSC
+        STATE_OSC,
+        STATE_ESC_IGNORE  /* Ignore next character after ESC( etc */
     } state;
     int escape_params[MAX_ESCAPE_PARAMS];
     int num_escape_params;
@@ -795,13 +796,18 @@ void term_process_char(struct terminal *term, unsigned char ch) {
             } else if (ch == ']') {
                 term->state = STATE_OSC;
                 term->escape_buf_len = 0;
-            } else if (ch == '(') {
+            } else if (ch == '(' || ch == ')') {
                 /* Character set selection - ignore next char */
-                term->state = STATE_NORMAL;
+                term->state = STATE_ESC_IGNORE;
             } else {
                 /* Unknown escape - return to normal */
                 term->state = STATE_NORMAL;
             }
+            break;
+
+        case STATE_ESC_IGNORE:
+            /* Consume one character and return to normal */
+            term->state = STATE_NORMAL;
             break;
 
         case STATE_CSI:
@@ -832,8 +838,12 @@ void term_process_char(struct terminal *term, unsigned char ch) {
             break;
 
         case STATE_OSC:
-            if (ch == '\007' || ch == '\033') {
+            if (ch == '\007') {
+                /* BEL terminates OSC */
                 term->state = STATE_NORMAL;
+            } else if (ch == '\033') {
+                /* ESC terminates OSC and starts new escape sequence */
+                term->state = STATE_ESC;
             }
             break;
     }
