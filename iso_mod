@@ -43,6 +43,13 @@ cp -r /usr/share/archiso/configs/releng/* "$PROFILE_DIR" || error_exit "Failed t
 echo "Mod ISO name..."
 sed -i 's/^iso_name=.*/iso_name="ArchInt"/' "$PROFILE_DIR/profiledef.sh"
 
+echo "Modifying COW overlay size to 1048576k in boot configs..."
+# Modify GRUB config - add size=1048576k to kernel boot parameters
+sed -i 's|\(linux /%INSTALL_DIR%/boot/%ARCH%/vmlinuz-linux.*\)|\1 size=1048576k|' "$PROFILE_DIR/grub/grub.cfg"
+
+# Modify SYSLINUX configs - add size=1048576k to APPEND lines
+find "$PROFILE_DIR/syslinux" -name "*.cfg" -exec sed -i 's|\(APPEND.*archiso.*\)|\1 size=1048576k|' {} \;
+
 echo "Adding fb_term and fonts to airootfs..."
 cd "$SCRIPT_DIR" || exit
 mkdir -p "$PROFILE_DIR/airootfs/root/fb_term"
