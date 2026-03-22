@@ -22,6 +22,7 @@
 #include <pty.h>
 #include <utmp.h>
 #include <signal.h>
+#include <time.h>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "fb_truetype.h"
@@ -30,6 +31,11 @@
 #define MAX_ESCAPE_PARAMS 16
 #define MAX_TERM_COLS 500
 #define MAX_TERM_ROWS 200
+
+/* Render mode */
+#define RENDER_FB   0   /* Direct framebuffer rendering */
+#define RENDER_TERM 1   /* ANSI escape sequences to terminal stdout */
+static int render_mode = RENDER_FB;
 
 /* Terminal dimensions - will be calculated dynamically */
 static int TERM_COLS = 80;
@@ -129,21 +135,21 @@ void init_color_palette() {
     }
 }
 
-int fb_open(struct framebuffer *fb, const char *device) {
+int fb_open(struct framebuffer *fb, const char *device, int quiet) {
     fb->fd = open(device, O_RDWR);
     if (fb->fd < 0) {
-        perror("Failed to open framebuffer");
+        if (!quiet) perror("Failed to open framebuffer");
         return -1;
     }
 
     if (ioctl(fb->fd, FBIOGET_VSCREENINFO, &fb->vinfo) < 0) {
-        perror("Failed to get variable screen info");
+        if (!quiet) perror("Failed to get variable screen info");
         close(fb->fd);
         return -1;
     }
 
     if (ioctl(fb->fd, FBIOGET_FSCREENINFO, &fb->finfo) < 0) {
-        perror("Failed to get fixed screen info");
+        if (!quiet) perror("Failed to get fixed screen info");
         close(fb->fd);
         return -1;
     }
@@ -868,6 +874,113 @@ void term_render(struct framebuffer *fb, struct terminal *term,
 }
 
 
+static int codepoint_to_utf8(uint32_t cp, char *buf) {
+    if (cp < 0x80) {
+        buf[0] = (char)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    } else {
+        buf[0] = (char)(0xF0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (char)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+}
+
+void term_render_ansi(struct terminal *term) {
+    static char outbuf[262144];  /* 256KB output buffer */
+    int outlen = 0;
+
+#define ANSI_EMIT(s, n) do { \
+    int _n = (n); \
+    if (outlen + _n > (int)sizeof(outbuf)) { \
+        write(STDOUT_FILENO, outbuf, outlen); outlen = 0; \
+    } \
+    memcpy(outbuf + outlen, s, _n); outlen += _n; \
+} while(0)
+
+    /* Synchronized output: tell the terminal to paint atomically.
+     * Supported by Ghostty, Konsole, kitty, WezTerm, xterm, etc.
+     * Terminals that don't support it simply ignore the sequence. */
+    ANSI_EMIT("\033[?2026h", 8);
+
+    /* Hide cursor during render to prevent flicker */
+    ANSI_EMIT("\033[?25l", 6);
+
+    uint32_t last_fg = 0xFFFFFFFF;
+    uint32_t last_bg = 0xFFFFFFFF;
+
+    for (int y = 0; y < TERM_ROWS; y++) {
+        /* Position cursor at start of row */
+        char pos[24];
+        int poslen = snprintf(pos, sizeof(pos), "\033[%d;1H", y + 1);
+        ANSI_EMIT(pos, poslen);
+
+        for (int x = 0; x < TERM_COLS; x++) {
+            struct cell *cell = &term->cells[y][x];
+
+            /* Emit combined fg+bg color change only when needed */
+            if (cell->fg_color != last_fg || cell->bg_color != last_bg) {
+                char color[72];
+                int clen = snprintf(color, sizeof(color),
+                    "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm",
+                    (cell->fg_color >> 16) & 0xFF,
+                    (cell->fg_color >> 8)  & 0xFF,
+                     cell->fg_color        & 0xFF,
+                    (cell->bg_color >> 16) & 0xFF,
+                    (cell->bg_color >> 8)  & 0xFF,
+                     cell->bg_color        & 0xFF);
+                ANSI_EMIT(color, clen);
+                last_fg = cell->fg_color;
+                last_bg = cell->bg_color;
+            }
+
+            /* Encode codepoint as UTF-8 and emit */
+            uint32_t cp = cell->codepoint ? cell->codepoint : ' ';
+            char utf8[4];
+            int utf8len = codepoint_to_utf8(cp, utf8);
+            ANSI_EMIT(utf8, utf8len);
+        }
+    }
+
+    /* Always draw cursor — don't respect cursor_visible from child since
+     * readline hides/shows it during redraws and we may catch it hidden.
+     * Use standard ANSI yellow bg + black fg: universally visible, no
+     * truecolor needed. */
+    if (term->cursor_y < TERM_ROWS && term->cursor_x < TERM_COLS) {
+        struct cell *cc = &term->cells[term->cursor_y][term->cursor_x];
+        char cur[40];
+        int curlen = snprintf(cur, sizeof(cur), "\033[%d;%dH\033[0m\033[30;43m",
+            term->cursor_y + 1, term->cursor_x + 1);
+        ANSI_EMIT(cur, curlen);
+        uint32_t cp = cc->codepoint ? cc->codepoint : ' ';
+        char utf8[4];
+        int utf8len = codepoint_to_utf8(cp, utf8);
+        ANSI_EMIT(utf8, utf8len);
+    }
+
+    /* Reset colors, steady-block cursor shape, reposition terminal cursor */
+    char curpos[72];
+    int curposlen = snprintf(curpos, sizeof(curpos), "\033[0m\033[2 q\033[%d;%dH\033[?25h\033[?2026l",
+        term->cursor_y + 1, term->cursor_x + 1);
+    ANSI_EMIT(curpos, curposlen);
+
+#undef ANSI_EMIT
+
+    if (outlen > 0) {
+        write(STDOUT_FILENO, outbuf, outlen);
+    }
+}
+
 int spawn_shell(int *master_fd, int cols, int rows) {
     struct winsize ws = {
         .ws_row = rows,
@@ -911,129 +1024,163 @@ int spawn_shell(int *master_fd, int cols, int rows) {
 }
 
 volatile sig_atomic_t running = 1;
+volatile sig_atomic_t terminal_resized = 0;
 
 void sigchld_handler(int sig) {
     (void)sig;
     running = 0;
 }
 
+void sigwinch_handler(int sig) {
+    (void)sig;
+    terminal_resized = 1;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <font.ttf> [font_size]\n", argv[0]);
-        fprintf(stderr, "  font.ttf  - Path to TrueType font file\n");
-        fprintf(stderr, "  font_size - Optional font size in pixels (default: auto-calculated)\n");
-        return 1;
+    int force_term = 0;
+    const char *font_path = NULL;
+    float user_font_size = 0.0f;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--term") == 0) {
+            force_term = 1;
+        } else if (font_path == NULL) {
+            font_path = argv[i];
+        } else {
+            user_font_size = atof(argv[i]);
+            if (user_font_size < 6.0f || user_font_size > 72.0f) {
+                fprintf(stderr, "Font size must be between 6 and 72\n");
+                return 1;
+            }
+        }
     }
 
     init_color_palette();
 
-    const char *font_path = argv[1];
-    float user_font_size = 0.0f;  /* 0 means auto-calculate */
-
-    /* Check if font size was specified */
-    if (argc >= 3) {
-        user_font_size = atof(argv[2]);
-        if (user_font_size < 6.0f || user_font_size > 72.0f) {
-            fprintf(stderr, "Font size must be between 6 and 72\n");
-            return 1;
-        }
-    }
-
+    /* Determine render mode */
     struct framebuffer fb = {0};
-    if (fb_open(&fb, "/dev/fb0") < 0) {
-        return 1;
+    fb.fd = -1;
+
+    if (!force_term) {
+        /* Try to open framebuffer silently; fall back to terminal mode if unavailable */
+        if (fb_open(&fb, "/dev/fb0", 1) == 0) {
+            render_mode = RENDER_FB;
+        } else {
+            render_mode = RENDER_TERM;
+        }
+    } else {
+        render_mode = RENDER_TERM;
     }
 
-    /* Load fonts */
-    struct font_entry fonts[MAX_FONTS];
-    int num_fonts = 0;
-
-    if (load_font(&fonts[num_fonts], font_path, "Primary") == 0) {
-        num_fonts++;
-    } else {
-        fprintf(stderr, "Failed to load primary font\n");
+    if (render_mode == RENDER_FB && font_path == NULL) {
+        fprintf(stderr, "Usage: %s [--term] [font.ttf [font_size]]\n", argv[0]);
+        fprintf(stderr, "  --term    - Force ANSI terminal output mode\n");
+        fprintf(stderr, "  font.ttf  - TrueType font (required for framebuffer mode)\n");
+        fprintf(stderr, "  font_size - Font size in pixels, 6-72 (framebuffer mode only)\n");
         fb_close(&fb);
         return 1;
     }
 
-    if (num_fonts < MAX_FONTS) {
-        if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf", "Arabic") == 0) {
+    /* Load fonts (only needed for framebuffer mode) */
+    struct font_entry fonts[MAX_FONTS];
+    int num_fonts = 0;
+    float scale = 0.0f;
+    int baseline = 0, char_width = 8, char_height = 16;
+
+    if (font_path != NULL) {
+        if (load_font(&fonts[num_fonts], font_path, "Primary") == 0) {
             num_fonts++;
-        }
-    }
-    if (num_fonts < MAX_FONTS) {
-        if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf", "Hebrew") == 0) {
-            num_fonts++;
-        }
-    }
-    if (num_fonts < MAX_FONTS) {
-        if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansThai-Regular.ttf", "Thai") == 0) {
-            num_fonts++;
-        }
-    }
-    if (num_fonts < MAX_FONTS) {
-        if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "CJK") == 0) {
-            num_fonts++;
+        } else {
+            fprintf(stderr, "Failed to load primary font\n");
+            if (render_mode == RENDER_FB) {
+                fb_close(&fb);
+                return 1;
+            }
         }
     }
 
-    /* Determine font size */
-    float font_size_px = (user_font_size > 0.0f) ? user_font_size : 16.0f;
-
-    /* Calculate initial font metrics */
-    float scale = stbtt_ScaleForPixelHeight(&fonts[0].info, font_size_px);
-
-    int ascent, descent, line_gap;
-    stbtt_GetFontVMetrics(&fonts[0].info, &ascent, &descent, &line_gap);
-    int baseline = (int)(ascent * scale);
-
-    /* Calculate character cell dimensions */
-    int char_height = (int)((ascent - descent) * scale) + 2;
-
-    /* Find maximum advance width across all printable ASCII characters */
-    int max_advance = 0;
-    for (int c = 32; c <= 126; c++) {  /* Space to tilde */
-        int adv, lsb;
-        stbtt_GetCodepointHMetrics(&fonts[0].info, c, &adv, &lsb);
-        if (adv > max_advance) max_advance = adv;
+    if (num_fonts > 0) {
+        if (num_fonts < MAX_FONTS)
+            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf", "Arabic") == 0)
+                num_fonts++;
+        if (num_fonts < MAX_FONTS)
+            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf", "Hebrew") == 0)
+                num_fonts++;
+        if (num_fonts < MAX_FONTS)
+            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansThai-Regular.ttf", "Thai") == 0)
+                num_fonts++;
+        if (num_fonts < MAX_FONTS)
+            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "CJK") == 0)
+                num_fonts++;
     }
 
-    int char_width = (int)(max_advance * scale) + 1;  /* Max width + 1px spacing */
+    if (render_mode == RENDER_FB) {
+        /* Calculate font metrics and terminal dimensions from framebuffer */
+        float font_size_px = (user_font_size > 0.0f) ? user_font_size : 16.0f;
+        scale = stbtt_ScaleForPixelHeight(&fonts[0].info, font_size_px);
 
-    /* Calculate terminal dimensions based on screen and character size */
-    TERM_COLS = (fb.width - 4) / char_width;   /* Leave 4px margin */
-    TERM_ROWS = (fb.height - 4) / char_height;
+        int ascent, descent, line_gap;
+        stbtt_GetFontVMetrics(&fonts[0].info, &ascent, &descent, &line_gap);
+        baseline = (int)(ascent * scale);
+        char_height = (int)((ascent - descent) * scale) + 2;
 
-    /* Clamp to reasonable limits */
-    if (TERM_COLS < 40) TERM_COLS = 40;
-    if (TERM_ROWS < 10) TERM_ROWS = 10;
-    if (TERM_COLS > MAX_TERM_COLS) TERM_COLS = MAX_TERM_COLS;
-    if (TERM_ROWS > MAX_TERM_ROWS) TERM_ROWS = MAX_TERM_ROWS;
+        int max_advance = 0;
+        for (int c = 32; c <= 126; c++) {
+            int adv, lsb;
+            stbtt_GetCodepointHMetrics(&fonts[0].info, c, &adv, &lsb);
+            if (adv > max_advance) max_advance = adv;
+        }
+        char_width = (int)(max_advance * scale) + 1;
 
-    fprintf(stderr, "Terminal size: %dx%d (char %dx%d, screen %dx%d)\n",
-            TERM_COLS, TERM_ROWS, char_width, char_height, fb.width, fb.height);
+        TERM_COLS = (fb.width - 4) / char_width;
+        TERM_ROWS = (fb.height - 4) / char_height;
+        if (TERM_COLS < 40)  TERM_COLS = 40;
+        if (TERM_ROWS < 10)  TERM_ROWS = 10;
+        if (TERM_COLS > MAX_TERM_COLS) TERM_COLS = MAX_TERM_COLS;
+        if (TERM_ROWS > MAX_TERM_ROWS) TERM_ROWS = MAX_TERM_ROWS;
 
-    fb_clear(&fb, 0x00000000);
+        fprintf(stderr, "Terminal size: %dx%d (char %dx%d, screen %dx%d)\n",
+                TERM_COLS, TERM_ROWS, char_width, char_height, fb.width, fb.height);
+
+        fb_clear(&fb, 0x00000000);
+    } else {
+        /* Get terminal dimensions from parent terminal */
+        struct winsize ws;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+            TERM_COLS = ws.ws_col;
+            TERM_ROWS = ws.ws_row;
+        } else {
+            TERM_COLS = 80;
+            TERM_ROWS = 24;
+        }
+        if (TERM_COLS > MAX_TERM_COLS) TERM_COLS = MAX_TERM_COLS;
+        if (TERM_ROWS > MAX_TERM_ROWS) TERM_ROWS = MAX_TERM_ROWS;
+
+        /* Enter alternate screen, clear, home, force steady block cursor */
+        write(STDOUT_FILENO, "\033[?1049h\033[2J\033[H\033[2 q", 20);
+    }
 
     /* Initialize terminal */
     struct terminal term;
     term_init(&term);
 
-    /* Set up signal handler */
+    /* Set up signal handlers */
     signal(SIGCHLD, sigchld_handler);
+    if (render_mode == RENDER_TERM)
+        signal(SIGWINCH, sigwinch_handler);
 
     /* Spawn shell */
     int master_fd;
     pid_t shell_pid = spawn_shell(&master_fd, TERM_COLS, TERM_ROWS);
     if (shell_pid < 0) {
-        fb_close(&fb);
+        if (render_mode == RENDER_FB) fb_close(&fb);
+        else write(STDOUT_FILENO, "\033[?1049l", 8);
         return 1;
     }
 
-    /* Set terminal's master_fd so it can respond to queries */
     term.master_fd = master_fd;
 
-    /* Set stdin to raw mode to capture all keyboard input */
+    /* Set stdin to raw mode */
     struct termios old_term;
     int stdin_is_tty = 0;
     if (tcgetattr(STDIN_FILENO, &old_term) == 0) {
@@ -1045,9 +1192,26 @@ int main(int argc, char **argv) {
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
     unsigned char buf[4096];
-    int needs_render = 1;  /* Flag to track if screen needs redrawing */
+    int needs_render = 1;
+
+    /* Track last render time so we don't flood the terminal with frames */
+    struct timespec last_render_ts = {0, 0};
 
     while (running) {
+        /* Handle terminal resize (SIGWINCH) */
+        if (terminal_resized && render_mode == RENDER_TERM) {
+            terminal_resized = 0;
+            struct winsize ws;
+            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+                TERM_COLS = ws.ws_col < MAX_TERM_COLS ? ws.ws_col : MAX_TERM_COLS;
+                TERM_ROWS = ws.ws_row < MAX_TERM_ROWS ? ws.ws_row : MAX_TERM_ROWS;
+                term.scroll_bottom = TERM_ROWS - 1;
+                struct winsize new_ws = { .ws_row = TERM_ROWS, .ws_col = TERM_COLS };
+                ioctl(master_fd, TIOCSWINSZ, &new_ws);
+                needs_render = 1;
+            }
+        }
+
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(STDIN_FILENO, &fds);
@@ -1059,7 +1223,6 @@ int main(int argc, char **argv) {
         int ret = select(max_fd + 1, &fds, NULL, NULL, &tv);
 
         if (ret > 0) {
-            /* Input from stdin - pass everything directly to PTY */
             if (FD_ISSET(STDIN_FILENO, &fds)) {
                 ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                 if (n > 0) {
@@ -1067,40 +1230,46 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Output from shell */
             if (FD_ISSET(master_fd, &fds)) {
-                /* Read all available data in a loop for better batching */
-                while (1) {
+                /* Cap reads per iteration so keyboard input stays responsive
+                 * even when the child produces output very fast (e.g. yes). */
+                int bytes_this_iter = 0;
+                while (bytes_this_iter < 65536) {
                     ssize_t n = read(master_fd, buf, sizeof(buf));
                     if (n > 0) {
                         for (ssize_t i = 0; i < n; i++) {
                             term_process_char(&term, buf[i]);
                         }
-                        needs_render = 1;  /* Mark that we need to redraw */
-
-                        /* Continue reading if buffer was full (more data likely available) */
-                        if (n < (ssize_t)sizeof(buf)) {
-                            break;  /* No more data available */
-                        }
+                        needs_render = 1;
+                        bytes_this_iter += (int)n;
+                        if (n < (ssize_t)sizeof(buf)) break;
                     } else if (n == 0) {
-                        running = 0;  /* Shell closed */
+                        running = 0;
                         break;
                     } else {
-                        /* EAGAIN or EWOULDBLOCK - no more data */
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
-                        /* Other error */
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         break;
                     }
                 }
             }
         }
 
-        /* Render terminal only when something changed */
         if (needs_render) {
-            term_render(&fb, &term, fonts, num_fonts, scale, baseline, char_width, char_height);
-            needs_render = 0;
+            /* Rate-limit to ~60fps using a real clock so fast output (yes, etc.)
+             * doesn't flood the outer terminal with thousands of frames/sec. */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_us = (now.tv_sec  - last_render_ts.tv_sec)  * 1000000L
+                            + (now.tv_nsec - last_render_ts.tv_nsec) / 1000L;
+            if (elapsed_us >= 16666) {
+                if (render_mode == RENDER_FB) {
+                    term_render(&fb, &term, fonts, num_fonts, scale, baseline, char_width, char_height);
+                } else {
+                    term_render_ansi(&term);
+                }
+                needs_render = 0;
+                last_render_ts = now;
+            }
         }
     }
 
@@ -1109,14 +1278,17 @@ int main(int argc, char **argv) {
         tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
     }
 
-    fb_clear(&fb, 0x00000000);
+    if (render_mode == RENDER_FB) {
+        fb_clear(&fb, 0x00000000);
+        fb_close(&fb);
+    } else {
+        /* Leave alternate screen, restore user's terminal */
+        write(STDOUT_FILENO, "\033[0m\033[?25h\033[?1049l", 19);
+    }
 
     for (int i = 0; i < num_fonts; i++) {
-        if (fonts[i].buffer) {
-            free(fonts[i].buffer);
-        }
+        if (fonts[i].buffer) free(fonts[i].buffer);
     }
-    fb_close(&fb);
 
     close(master_fd);
 
