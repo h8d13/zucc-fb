@@ -85,6 +85,7 @@ struct terminal {
         STATE_ESC,
         STATE_CSI,
         STATE_OSC,
+        STATE_DCS,        /* ESC P ... ST   (DCS, e.g. XTGETTCAP) */
         STATE_ESC_IGNORE  /* Ignore next character after ESC( etc */
     } state;
     int escape_params[MAX_ESCAPE_PARAMS];
@@ -802,11 +803,14 @@ void term_process_char(struct terminal *term, unsigned char ch) {
             } else if (ch == ']') {
                 term->state = STATE_OSC;
                 term->escape_buf_len = 0;
+            } else if (ch == 'P') {
+                /* DCS - swallow payload until ST (ESC \) or BEL */
+                term->state = STATE_DCS;
             } else if (ch == '(' || ch == ')') {
                 /* Character set selection - ignore next char */
                 term->state = STATE_ESC_IGNORE;
             } else {
-                /* Unknown escape - return to normal */
+                /* Unknown escape (incl. ESC =, ESC >, ESC \, ESC 7/8 etc) - return to normal */
                 term->state = STATE_NORMAL;
             }
             break;
@@ -827,8 +831,10 @@ void term_process_char(struct terminal *term, unsigned char ch) {
                 if (term->num_escape_params < MAX_ESCAPE_PARAMS) {
                     term->num_escape_params++;
                 }
-            } else if (ch == '?') {
-                /* Mark as private mode sequence */
+            } else if (ch >= '<' && ch <= '?') {
+                /* Private parameter prefix bytes (ECMA-48): <, =, >, ?
+                 * Used by xterm-style queries like CSI > 4;1m, CSI > c, CSI ? u.
+                 * Flag and keep parsing rest of CSI. */
                 term->private_mode = 1;
             } else if (ch >= '@' && ch <= '~') {
                 term_handle_csi(term, ch);
@@ -850,6 +856,17 @@ void term_process_char(struct terminal *term, unsigned char ch) {
             } else if (ch == '\033') {
                 /* ESC terminates OSC and starts new escape sequence */
                 term->state = STATE_ESC;
+            }
+            break;
+
+        case STATE_DCS:
+            /* Consume DCS payload silently. ESC -> back to ESC state
+             * (ST = ESC \ will then drop to NORMAL via unknown-escape path).
+             * BEL also accepted as informal terminator. */
+            if (ch == '\033') {
+                term->state = STATE_ESC;
+            } else if (ch == '\007') {
+                term->state = STATE_NORMAL;
             }
             break;
     }
