@@ -58,6 +58,9 @@ struct font_entry {
     unsigned char *buffer;
     size_t buffer_size;
     const char *name;
+    float scale;     /* Per-font scale; differs across fonts because each has
+                      * its own units-per-em. Computed after font_size_px known. */
+    int baseline;    /* Pixel offset from top of cell to baseline, per-font. */
 };
 
 struct cell {
@@ -97,10 +100,38 @@ struct terminal {
     /* UTF-8 decoder state */
     unsigned char utf8_buf[4];
     int utf8_buf_len;
+
+    /* Per-row dirty flags. Render skips rows where dirty==0. */
+    unsigned char dirty[MAX_TERM_ROWS];
+    int last_cursor_y;  /* For repainting old cursor row on move */
+    int full_clear_pending;  /* Emit \e[2J before next frame */
 };
+
+static inline void mark_dirty(struct terminal *term, int y) {
+    if (y >= 0 && y < MAX_TERM_ROWS) term->dirty[y] = 1;
+}
+
+static inline void mark_dirty_range(struct terminal *term, int y0, int y1) {
+    if (y0 < 0) y0 = 0;
+    if (y1 >= MAX_TERM_ROWS) y1 = MAX_TERM_ROWS - 1;
+    for (int y = y0; y <= y1; y++) term->dirty[y] = 1;
+}
+
+static inline void mark_all_dirty(struct terminal *term) {
+    memset(term->dirty, 1, sizeof(term->dirty));
+    /* Full repaints pair with an outer-terminal clear inside the sync block
+     * so stale glyphs from previous frames cant linger past `clear`,
+     * fast-redraw bursts (pacman bars), or resize. */
+    term->full_clear_pending = 1;
+}
 
 /* Color palette (xterm-256 compatible) */
 uint32_t color_palette[256];
+
+/* Sentinels for "use outer terminal default" - distinct from palette[0]/[15]
+ * (explicit black/white). Top byte non-zero = invalid 24-bit RGB, no collision. */
+#define DEFAULT_FG 0xFE000001u
+#define DEFAULT_BG 0xFE000002u
 
 void init_color_palette() {
     /* Basic 16 colors */
@@ -323,18 +354,18 @@ uint32_t utf8_decode(const unsigned char **p) {
     return codepoint;
 }
 
-stbtt_fontinfo* find_font_for_codepoint(struct font_entry *fonts, int num_fonts, uint32_t codepoint) {
+struct font_entry* find_font_for_codepoint(struct font_entry *fonts, int num_fonts, uint32_t codepoint) {
     for (int i = 0; i < num_fonts; i++) {
         int glyph_index = stbtt_FindGlyphIndex(&fonts[i].info, codepoint);
         if (glyph_index != 0) {
-            return &fonts[i].info;
+            return &fonts[i];
         }
     }
-    return &fonts[0].info;
+    return &fonts[0];
 }
 
 void render_char(struct framebuffer *fb, struct font_entry *fonts, int num_fonts,
-                 uint32_t codepoint, int x, int y, float scale, int baseline,
+                 uint32_t codepoint, int x, int y,
                  uint32_t fg_color, uint32_t bg_color, int char_width, int char_height) {
 
     /* Clear cell background */
@@ -348,13 +379,18 @@ void render_char(struct framebuffer *fb, struct font_entry *fonts, int num_fonts
         return;
     }
 
-    stbtt_fontinfo *current_font = find_font_for_codepoint(fonts, num_fonts, codepoint);
+    /* Use the picked font's own scale + baseline, not the primary's. Different
+     * fonts have different units-per-em, so reusing primary's scale gives
+     * wrong-size glyphs for fallbacks (Arabic, CJK, etc). */
+    struct font_entry *fe = find_font_for_codepoint(fonts, num_fonts, codepoint);
+    stbtt_fontinfo *current_font = &fe->info;
+    float fscale = fe->scale;
 
     int advance, lsb;
     stbtt_GetCodepointHMetrics(current_font, codepoint, &advance, &lsb);
 
     int c_x1, c_y1, c_x2, c_y2;
-    stbtt_GetCodepointBitmapBox(current_font, codepoint, scale, scale, &c_x1, &c_y1, &c_x2, &c_y2);
+    stbtt_GetCodepointBitmapBox(current_font, codepoint, fscale, fscale, &c_x1, &c_y1, &c_x2, &c_y2);
 
     int bm_width = c_x2 - c_x1;
     int bm_height = c_y2 - c_y1;
@@ -363,9 +399,9 @@ void render_char(struct framebuffer *fb, struct font_entry *fonts, int num_fonts
         unsigned char *bitmap = malloc(bm_width * bm_height);
         if (bitmap) {
             stbtt_MakeCodepointBitmap(current_font, bitmap, bm_width, bm_height,
-                                     bm_width, scale, scale, codepoint);
+                                     bm_width, fscale, fscale, codepoint);
 
-            fb_draw_bitmap(fb, x + c_x1, y + baseline + c_y1,
+            fb_draw_bitmap(fb, x + c_x1, y + fe->baseline + c_y1,
                           bitmap, bm_width, bm_height, fg_color, bg_color);
 
             free(bitmap);
@@ -375,12 +411,13 @@ void render_char(struct framebuffer *fb, struct font_entry *fonts, int num_fonts
 
 void term_init(struct terminal *term) {
     memset(term, 0, sizeof(*term));
-    term->fg_color = 0x00FFFFFF;
-    term->bg_color = 0x00000000;
+    term->fg_color = DEFAULT_FG;
+    term->bg_color = DEFAULT_BG;
     term->scroll_bottom = TERM_ROWS - 1;
     term->cursor_visible = 1;
     term->utf8_buf_len = 0;
     term->master_fd = -1;
+    term->last_cursor_y = 0;
 
     for (int y = 0; y < TERM_ROWS; y++) {
         for (int x = 0; x < TERM_COLS; x++) {
@@ -389,6 +426,7 @@ void term_init(struct terminal *term) {
             term->cells[y][x].bg_color = term->bg_color;
         }
     }
+    mark_all_dirty(term);
 }
 
 void term_scroll_up(struct terminal *term) {
@@ -402,6 +440,7 @@ void term_scroll_up(struct terminal *term) {
         term->cells[term->scroll_bottom][x].fg_color = term->fg_color;
         term->cells[term->scroll_bottom][x].bg_color = term->bg_color;
     }
+    mark_dirty_range(term, term->scroll_top, term->scroll_bottom);
 }
 
 void term_scroll_down(struct terminal *term) {
@@ -415,6 +454,7 @@ void term_scroll_down(struct terminal *term) {
         term->cells[term->scroll_top][x].fg_color = term->fg_color;
         term->cells[term->scroll_top][x].bg_color = term->bg_color;
     }
+    mark_dirty_range(term, term->scroll_top, term->scroll_bottom);
 }
 
 void term_newline(struct terminal *term) {
@@ -443,6 +483,7 @@ void term_putchar(struct terminal *term, uint32_t codepoint) {
     term->cells[term->cursor_y][term->cursor_x].fg_color = term->fg_color;
     term->cells[term->cursor_y][term->cursor_x].bg_color = term->bg_color;
     term->cells[term->cursor_y][term->cursor_x].bold = term->bold;
+    mark_dirty(term, term->cursor_y);
 
     term->cursor_x++;
 }
@@ -494,6 +535,7 @@ void term_handle_csi(struct terminal *term, char final) {
                         term->cells[y][x].bg_color = term->bg_color;
                     }
                 }
+                mark_dirty_range(term, term->cursor_y, TERM_ROWS - 1);
             } else if (p[0] == 1) {
                 /* Clear from beginning to cursor */
                 for (int y = 0; y < term->cursor_y; y++) {
@@ -508,6 +550,7 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->cells[term->cursor_y][x].fg_color = term->fg_color;
                     term->cells[term->cursor_y][x].bg_color = term->bg_color;
                 }
+                mark_dirty_range(term, 0, term->cursor_y);
             } else if (p[0] == 2 || p[0] == 3) {
                 /* Clear entire screen (3 also clears scrollback) */
                 for (int y = 0; y < TERM_ROWS; y++) {
@@ -517,6 +560,7 @@ void term_handle_csi(struct terminal *term, char final) {
                         term->cells[y][x].bg_color = term->bg_color;
                     }
                 }
+                mark_all_dirty(term);
             }
             break;
 
@@ -543,20 +587,21 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->cells[term->cursor_y][x].bg_color = term->bg_color;
                 }
             }
+            mark_dirty(term, term->cursor_y);
             break;
 
         case 'm': /* SGR - Select Graphic Rendition */
             if (n == 0) {
                 /* No parameters = reset */
-                term->fg_color = 0x00FFFFFF;
-                term->bg_color = 0x00000000;
+                term->fg_color = DEFAULT_FG;
+                term->bg_color = DEFAULT_BG;
                 term->bold = 0;
             }
             for (int i = 0; i < n; i++) {
                 if (p[i] == 0) {
                     /* Reset */
-                    term->fg_color = 0x00FFFFFF;
-                    term->bg_color = 0x00000000;
+                    term->fg_color = DEFAULT_FG;
+                    term->bg_color = DEFAULT_BG;
                     term->bold = 0;
                 } else if (p[i] == 1) {
                     term->bold = 1;
@@ -567,13 +612,13 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->fg_color = color_palette[p[i] - 30];
                 } else if (p[i] == 39) {
                     /* Default foreground */
-                    term->fg_color = 0x00FFFFFF;
+                    term->fg_color = DEFAULT_FG;
                 } else if (p[i] >= 40 && p[i] <= 47) {
                     /* Background color */
                     term->bg_color = color_palette[p[i] - 40];
                 } else if (p[i] == 49) {
                     /* Default background */
-                    term->bg_color = 0x00000000;
+                    term->bg_color = DEFAULT_BG;
                 } else if (p[i] >= 90 && p[i] <= 97) {
                     /* Bright foreground color */
                     term->fg_color = color_palette[p[i] - 90 + 8];
@@ -655,6 +700,7 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->cells[term->cursor_y][x].bg_color = term->bg_color;
                 }
             }
+            mark_dirty_range(term, term->cursor_y, term->scroll_bottom);
             break;
 
         case 'M': /* Delete Line */
@@ -669,6 +715,7 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->cells[term->scroll_bottom][x].bg_color = term->bg_color;
                 }
             }
+            mark_dirty_range(term, term->cursor_y, term->scroll_bottom);
             break;
 
         case 'X': /* Erase Characters */
@@ -680,6 +727,7 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->cells[term->cursor_y][term->cursor_x + i].bg_color = term->bg_color;
                 }
             }
+            mark_dirty(term, term->cursor_y);
             break;
 
         case 'P': /* Delete Characters */
@@ -694,6 +742,7 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->cells[term->cursor_y][x].bg_color = term->bg_color;
                 }
             }
+            mark_dirty(term, term->cursor_y);
             break;
 
         case '@': /* Insert Characters */
@@ -708,6 +757,7 @@ void term_handle_csi(struct terminal *term, char final) {
                     term->cells[term->cursor_y][x].bg_color = term->bg_color;
                 }
             }
+            mark_dirty(term, term->cursor_y);
             break;
 
         case 'n': /* Device Status Report */
@@ -850,12 +900,31 @@ void term_process_char(struct terminal *term, unsigned char ch) {
             break;
 
         case STATE_OSC:
-            if (ch == '\007') {
-                /* BEL terminates OSC */
-                term->state = STATE_NORMAL;
-            } else if (ch == '\033') {
-                /* ESC terminates OSC and starts new escape sequence */
-                term->state = STATE_ESC;
+            if (ch == '\007' || ch == '\033') {
+                /* OSC complete. Passthrough OSC 9;4 (progress) to parent
+                 * terminal in --term mode so loading bars surface in
+                 * Ghostty/Konsole/etc. Other OSCs (title, cwd, queries)
+                 * stay swallowed since responses must go to child PTY,
+                 * not parent stdout. */
+                if (render_mode == RENDER_TERM
+                    && term->escape_buf_len >= 4
+                    && memcmp(term->escape_buf, "9;4;", 4) == 0) {
+                    char out[300];
+                    int len = 0;
+                    out[len++] = '\033';
+                    out[len++] = ']';
+                    int n = term->escape_buf_len;
+                    if (n > (int)sizeof(out) - 4) n = sizeof(out) - 4;
+                    memcpy(out + len, term->escape_buf, n);
+                    len += n;
+                    out[len++] = '\033';
+                    out[len++] = '\\';
+                    write(STDOUT_FILENO, out, len);
+                }
+                term->escape_buf_len = 0;
+                term->state = (ch == '\033') ? STATE_ESC : STATE_NORMAL;
+            } else if (term->escape_buf_len < (int)sizeof(term->escape_buf) - 1) {
+                term->escape_buf[term->escape_buf_len++] = ch;
             }
             break;
 
@@ -874,7 +943,7 @@ void term_process_char(struct terminal *term, unsigned char ch) {
 
 void term_render(struct framebuffer *fb, struct terminal *term,
                  struct font_entry *fonts, int num_fonts,
-                 float scale, int baseline, int char_width, int char_height) {
+                 int char_width, int char_height) {
 
     for (int y = 0; y < TERM_ROWS; y++) {
         for (int x = 0; x < TERM_COLS; x++) {
@@ -883,9 +952,10 @@ void term_render(struct framebuffer *fb, struct terminal *term,
             int px = x * char_width;
             int py = y * char_height;
 
+            uint32_t fg = (cell->fg_color == DEFAULT_FG) ? 0x00FFFFFF : cell->fg_color;
+            uint32_t bg = (cell->bg_color == DEFAULT_BG) ? 0x00000000 : cell->bg_color;
             render_char(fb, fonts, num_fonts, cell->codepoint, px, py,
-                       scale, baseline, cell->fg_color, cell->bg_color,
-                       char_width, char_height);
+                       fg, bg, char_width, char_height);
         }
     }
 }
@@ -925,18 +995,39 @@ void term_render_ansi(struct terminal *term) {
     memcpy(outbuf + outlen, s, _n); outlen += _n; \
 } while(0)
 
-    /* Synchronized output: tell the terminal to paint atomically.
-     * Supported by Ghostty, Konsole, kitty, WezTerm, xterm, etc.
-     * Terminals that don't support it simply ignore the sequence. */
-    ANSI_EMIT("\033[?2026h", 8);
+    /* Cursor moved row -> repaint old row to clear stale cursor cell,
+     * and current row so cursor block renders on fresh content. */
+    if (term->last_cursor_y != term->cursor_y) {
+        mark_dirty(term, term->last_cursor_y);
+    }
+    mark_dirty(term, term->cursor_y);
 
-    /* Hide cursor during render to prevent flicker */
-    ANSI_EMIT("\033[?25l", 6);
+    /* Skip render entirely if nothing dirty. */
+    int any_dirty = 0;
+    for (int y = 0; y < TERM_ROWS; y++) {
+        if (term->dirty[y]) { any_dirty = 1; break; }
+    }
+    if (!any_dirty) return;
 
-    uint32_t last_fg = 0xFFFFFFFF;
-    uint32_t last_bg = 0xFFFFFFFF;
+    /* Synchronized output: outer terminal buffers everything between 2026h
+     * and 2026l, then paints atomically. Per-frame cursor hide/show inside
+     * the sync block is invisible on supporting terminals (Ghostty, Konsole,
+     * kitty, WezTerm, xterm). Non-supporting terminals see a brief blink. */
+    ANSI_EMIT("\033[?2026h\033[?25l", 14);
+
+    /* Full repaint: clear outer screen first so stale glyphs cant linger.
+     * Inside the sync block so atomic, no visible blackout. */
+    if (term->full_clear_pending) {
+        ANSI_EMIT("\033[H\033[2J", 7);
+        term->full_clear_pending = 0;
+    }
+
+    uint32_t last_fg = 0;  /* 0 = no SGR emitted yet (sentinels are nonzero) */
+    uint32_t last_bg = 0;
 
     for (int y = 0; y < TERM_ROWS; y++) {
+        if (!term->dirty[y]) continue;
+
         /* Position cursor at start of row */
         char pos[24];
         int poslen = snprintf(pos, sizeof(pos), "\033[%d;1H", y + 1);
@@ -945,18 +1036,32 @@ void term_render_ansi(struct terminal *term) {
         for (int x = 0; x < TERM_COLS; x++) {
             struct cell *cell = &term->cells[y][x];
 
-            /* Emit combined fg+bg color change only when needed */
+            /* Build SGR only when fg or bg actually changed. Sentinel colors
+             * (DEFAULT_FG/BG) emit 39/49 so outer terminal theme shows through;
+             * explicit colors emit truecolor. */
             if (cell->fg_color != last_fg || cell->bg_color != last_bg) {
-                char color[72];
-                int clen = snprintf(color, sizeof(color),
-                    "\033[38;2;%d;%d;%d;48;2;%d;%d;%dm",
-                    (cell->fg_color >> 16) & 0xFF,
-                    (cell->fg_color >> 8)  & 0xFF,
-                     cell->fg_color        & 0xFF,
-                    (cell->bg_color >> 16) & 0xFF,
-                    (cell->bg_color >> 8)  & 0xFF,
-                     cell->bg_color        & 0xFF);
-                ANSI_EMIT(color, clen);
+                char buf[80];
+                int len = 0;
+                buf[len++] = '\033'; buf[len++] = '[';
+                if (cell->fg_color == DEFAULT_FG) {
+                    buf[len++] = '3'; buf[len++] = '9';
+                } else {
+                    len += snprintf(buf+len, sizeof(buf)-len, "38;2;%d;%d;%d",
+                        (cell->fg_color >> 16) & 0xFF,
+                        (cell->fg_color >> 8)  & 0xFF,
+                         cell->fg_color        & 0xFF);
+                }
+                buf[len++] = ';';
+                if (cell->bg_color == DEFAULT_BG) {
+                    buf[len++] = '4'; buf[len++] = '9';
+                } else {
+                    len += snprintf(buf+len, sizeof(buf)-len, "48;2;%d;%d;%d",
+                        (cell->bg_color >> 16) & 0xFF,
+                        (cell->bg_color >> 8)  & 0xFF,
+                         cell->bg_color        & 0xFF);
+                }
+                buf[len++] = 'm';
+                ANSI_EMIT(buf, len);
                 last_fg = cell->fg_color;
                 last_bg = cell->bg_color;
             }
@@ -969,25 +1074,12 @@ void term_render_ansi(struct terminal *term) {
         }
     }
 
-    /* Always draw cursor — don't respect cursor_visible from child since
-     * readline hides/shows it during redraws and we may catch it hidden.
-     * Use standard ANSI yellow bg + black fg: universally visible, no
-     * truecolor needed. */
-    if (term->cursor_y < TERM_ROWS && term->cursor_x < TERM_COLS) {
-        struct cell *cc = &term->cells[term->cursor_y][term->cursor_x];
-        char cur[40];
-        int curlen = snprintf(cur, sizeof(cur), "\033[%d;%dH\033[0m\033[30;43m",
-            term->cursor_y + 1, term->cursor_x + 1);
-        ANSI_EMIT(cur, curlen);
-        uint32_t cp = cc->codepoint ? cc->codepoint : ' ';
-        char utf8[4];
-        int utf8len = codepoint_to_utf8(cp, utf8);
-        ANSI_EMIT(utf8, utf8len);
-    }
-
-    /* Reset colors, steady-block cursor shape, reposition terminal cursor */
+    /* Reset SGR, position outer cursor at our (cy,cx), show cursor, close sync.
+     * Outer terminal renders its native cursor at that position - inherits
+     * the cell's char + theme-aware reverse-video, matching default fish UX. */
     char curpos[72];
-    int curposlen = snprintf(curpos, sizeof(curpos), "\033[0m\033[2 q\033[%d;%dH\033[?25h\033[?2026l",
+    int curposlen = snprintf(curpos, sizeof(curpos),
+        "\033[0m\033[%d;%dH\033[?25h\033[?2026l",
         term->cursor_y + 1, term->cursor_x + 1);
     ANSI_EMIT(curpos, curposlen);
 
@@ -996,6 +1088,10 @@ void term_render_ansi(struct terminal *term) {
     if (outlen > 0) {
         write(STDOUT_FILENO, outbuf, outlen);
     }
+
+    /* Frame committed - clear dirty flags and snapshot cursor row. */
+    memset(term->dirty, 0, sizeof(term->dirty));
+    term->last_cursor_y = term->cursor_y;
 }
 
 int spawn_shell(int *master_fd, int cols, int rows) {
@@ -1101,8 +1197,7 @@ int main(int argc, char **argv) {
     /* Load fonts (only needed for framebuffer mode) */
     struct font_entry fonts[MAX_FONTS];
     int num_fonts = 0;
-    float scale = 0.0f;
-    int baseline = 0, char_width = 8, char_height = 16;
+    int char_width = 8, char_height = 16;
 
     if (font_path != NULL) {
         if (load_font(&fonts[num_fonts], font_path, "Primary") == 0) {
@@ -1117,29 +1212,33 @@ int main(int argc, char **argv) {
     }
 
     if (num_fonts > 0) {
-        if (num_fonts < MAX_FONTS)
-            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf", "Arabic") == 0)
+        const struct { const char *path; const char *name; } fallbacks[] = {
+            {"/usr/share/fonts/noto/NotoSansArabic-Regular.ttf", "Arabic"},
+            {"/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf", "Hebrew"},
+            {"/usr/share/fonts/noto/NotoSansThai-Regular.ttf",   "Thai"},
+            {"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc","CJK"},
+        };
+        for (size_t i = 0; i < sizeof(fallbacks)/sizeof(fallbacks[0]); i++) {
+            if (num_fonts >= MAX_FONTS) break;
+            if (load_font(&fonts[num_fonts], fallbacks[i].path, fallbacks[i].name) == 0)
                 num_fonts++;
-        if (num_fonts < MAX_FONTS)
-            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf", "Hebrew") == 0)
-                num_fonts++;
-        if (num_fonts < MAX_FONTS)
-            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto/NotoSansThai-Regular.ttf", "Thai") == 0)
-                num_fonts++;
-        if (num_fonts < MAX_FONTS)
-            if (load_font(&fonts[num_fonts], "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "CJK") == 0)
-                num_fonts++;
+        }
     }
 
     if (render_mode == RENDER_FB) {
-        /* Calculate font metrics and terminal dimensions from framebuffer */
+        /* Per-font scale + baseline, sized to fit primary's char_height so all
+         * glyphs land aligned regardless of fallback font's intrinsic metrics. */
         float font_size_px = (user_font_size > 0.0f) ? user_font_size : 16.0f;
-        scale = stbtt_ScaleForPixelHeight(&fonts[0].info, font_size_px);
+        for (int i = 0; i < num_fonts; i++) {
+            fonts[i].scale = stbtt_ScaleForPixelHeight(&fonts[i].info, font_size_px);
+            int asc, desc, lg;
+            stbtt_GetFontVMetrics(&fonts[i].info, &asc, &desc, &lg);
+            fonts[i].baseline = (int)(asc * fonts[i].scale);
+        }
 
         int ascent, descent, line_gap;
         stbtt_GetFontVMetrics(&fonts[0].info, &ascent, &descent, &line_gap);
-        baseline = (int)(ascent * scale);
-        char_height = (int)((ascent - descent) * scale) + 2;
+        char_height = (int)((ascent - descent) * fonts[0].scale) + 2;
 
         int max_advance = 0;
         for (int c = 32; c <= 126; c++) {
@@ -1147,7 +1246,7 @@ int main(int argc, char **argv) {
             stbtt_GetCodepointHMetrics(&fonts[0].info, c, &adv, &lsb);
             if (adv > max_advance) max_advance = adv;
         }
-        char_width = (int)(max_advance * scale) + 1;
+        char_width = (int)(max_advance * fonts[0].scale) + 1;
 
         TERM_COLS = (fb.width - 4) / char_width;
         TERM_ROWS = (fb.height - 4) / char_height;
@@ -1173,8 +1272,10 @@ int main(int argc, char **argv) {
         if (TERM_COLS > MAX_TERM_COLS) TERM_COLS = MAX_TERM_COLS;
         if (TERM_ROWS > MAX_TERM_ROWS) TERM_ROWS = MAX_TERM_ROWS;
 
-        /* Enter alternate screen, clear, home, force steady block cursor */
-        write(STDOUT_FILENO, "\033[?1049h\033[2J\033[H\033[2 q", 20);
+        /* Enter alt screen, clear, home. Cursor stays visible (outer terminal
+         * draws its native theme-aware cursor; per-frame hide/show inside
+         * sync block prevents jumping during row repaints). */
+        write(STDOUT_FILENO, "\033[?1049h\033[2J\033[H", 11);
     }
 
     /* Initialize terminal */
@@ -1225,6 +1326,7 @@ int main(int argc, char **argv) {
                 term.scroll_bottom = TERM_ROWS - 1;
                 struct winsize new_ws = { .ws_row = TERM_ROWS, .ws_col = TERM_COLS };
                 ioctl(master_fd, TIOCSWINSZ, &new_ws);
+                mark_all_dirty(&term);
                 needs_render = 1;
             }
         }
@@ -1234,7 +1336,7 @@ int main(int argc, char **argv) {
         FD_SET(STDIN_FILENO, &fds);
         FD_SET(master_fd, &fds);
 
-        struct timeval tv = {0, 16666}; /* ~60fps */
+        struct timeval tv = {0, 8333}; /* ~120fps select wakeup */
 
         int max_fd = (master_fd > STDIN_FILENO) ? master_fd : STDIN_FILENO;
         int ret = select(max_fd + 1, &fds, NULL, NULL, &tv);
@@ -1272,15 +1374,13 @@ int main(int argc, char **argv) {
         }
 
         if (needs_render) {
-            /* Rate-limit to ~60fps using a real clock so fast output (yes, etc.)
-             * doesn't flood the outer terminal with thousands of frames/sec. */
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             long elapsed_us = (now.tv_sec  - last_render_ts.tv_sec)  * 1000000L
                             + (now.tv_nsec - last_render_ts.tv_nsec) / 1000L;
-            if (elapsed_us >= 16666) {
+            if (elapsed_us >= 8333 || term.full_clear_pending) {
                 if (render_mode == RENDER_FB) {
-                    term_render(&fb, &term, fonts, num_fonts, scale, baseline, char_width, char_height);
+                    term_render(&fb, &term, fonts, num_fonts, char_width, char_height);
                 } else {
                     term_render_ansi(&term);
                 }

@@ -3,3 +3,5 @@ out/*
 *.tar.gz
 a/*
 archiso_*/
+vg-mem.log
+massif.out*
